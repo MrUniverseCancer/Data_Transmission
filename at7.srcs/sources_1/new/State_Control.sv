@@ -73,10 +73,15 @@ module State_Control
 
 
 
-
+    // 系统初始化的控制信号
     initial begin
         send_state_tmp = INITIAL_STATE;
     end
+
+    // 控制信号的更新
+    // 1. 通过命令帧解析出来的控制信号来更新
+    //   1. 在command_work有效的情况下，根据command_usb_bt_uart的选项可以控制——usb、bt、uart的开关
+    // 2. TODO：之后支持与SD卡的交互
     always @(posedge clk) begin
         if(!rstn) begin
             send_state_tmp <= send_state_tmp; // 重置不改变其传输状态
@@ -111,17 +116,23 @@ module State_Control
         
     end
 
+    // 下面两个是usb和uart的控制信号
+    // 主要描述了：两个模块的FIFO使能信号和数据来源
+    // 核心是，模块的 写使能 与 TOP'FIFO的 读使能 呈现组合逻辑关系，与控制信号和模块本身的FIFO的状态有关
+    // error: fifo_rd_en 使能后，下一个时钟才能取出正确的结果，所以xxx_fifo_wr_en信号在自己的模块内需要缓存一个时钟对齐周期
+
     // USB 模块
     assign usb_data_from_fifo = fifo_rd_data;
-    assign usb_fifo_wr_en = fifo_rd_en && send_state_tmp[2] && usb_able_to_write; // TODO:
+    assign usb_fifo_wr_en = fifo_rd_en && send_state_tmp[2] && usb_able_to_write;
 
-    // uart && bt
+    // uart && bt 模块
     assign uart_data_from_fifo = fifo_rd_data;
     assign uart_fifo_wr_en = fifo_rd_en && (send_state_tmp[1] | send_state_tmp[0]) && uart_able_to_write; 
-    // 是否需要接收数据，控制权完全交给uart_bt_top模块自行决定
 
-    // 通过返回帧o_return_data_valid来控制，为了减小延时，统一缓存一个周期
-    // 即使在输出状态，o_return_data_valid=0，由于之前的保证也能够使得o_data_valid一定为0
+    // FIFO的写使能和数据来源
+
+    // 通过返回帧o_return_data_valid来控制，为了减小延时(纯组合逻辑)，统一缓存一个周期
+    // 即使在输出状态，o_return_data_valid=0，由于之前的保证(见TODO:模块)，已经确保使得o_data_valid一定为0
     always @(posedge clk) begin
         if(o_return_data_valid) begin
             fifo_wr_data <= o_return_data; // 在i_returnFrame_begin期间，才会输出返回帧，以返回帧优先
@@ -134,29 +145,50 @@ module State_Control
     end
 
     // 输出数据的权限
+    // 核心逻辑是：考虑每一个通道的使能
+
+    logic [ 0: 0] usb_Fact;
+    logic [ 0: 0] uart_Fact;
+    logic [ 0: 0] SD_Fact;
+    assign usb_Fact = send_state_tmp[2] ? usb_able_to_write : 1'b1;
+    assign uart_Fact = (send_state_tmp[1] | send_state_tmp[0]) ? uart_able_to_write : 1'b1;
+    assign SD_Fact = send_state_tmp[3] ? 1'b0 : 1'b1; // TODO: SD卡的权限
     always @(*) begin
-        fifo_rd_en = 0;
         if(fifo_empty) begin
             // fifo为空
+            fifo_rd_en = 0;        
+        end
+        else if(!send_state_tmp) begin
+            // 不允许发送数据，但是所有的Fact都是1，所以需要格外修正
             fifo_rd_en = 0;
-        end
-        else if(send_state_tmp[1] | send_state_tmp[0]) begin
-            // 允许蓝牙,uart发送数据
-            fifo_rd_en = uart_able_to_write & usb_able_to_write; // uart/bt优先级最高的情况下，uart/bt模块愿意接收数据，才从fifo中读取数据
-        end
-        else if(send_state_tmp[2]) begin
-            // 允许USB发送数据
-            fifo_rd_en = usb_able_to_write; // usb优先级最高的情况下，usb模块愿意接收数据，才从fifo中读取数据
-        end    
-        else if(send_state_tmp[3]) begin
-            // 允许SD卡发送数据
-            // TODO:
         end
         else begin
-            // 不允许发送数据
-            fifo_rd_en = 0;
+            fifo_rd_en = usb_Fact & uart_Fact & SD_Fact;
         end
     end
+    // always @(*) begin
+    //     fifo_rd_en = 0;
+    //     if(fifo_empty) begin
+    //         // fifo为空
+    //         fifo_rd_en = 0;
+    //     end
+    //     else if(send_state_tmp[1] | send_state_tmp[0]) begin
+    //         // 允许蓝牙,uart发送数据
+    //         fifo_rd_en = uart_able_to_write & usb_able_to_write; // uart/bt优先级最高的情况下，uart/bt模块愿意接收数据，才从fifo中读取数据
+    //     end
+    //     else if(send_state_tmp[2]) begin
+    //         // 允许USB发送数据
+    //         fifo_rd_en = usb_able_to_write; // usb优先级最高的情况下，usb模块愿意接收数据，才从fifo中读取数据
+    //     end    
+    //     else if(send_state_tmp[3]) begin
+    //         // 允许SD卡发送数据
+    //         // TODO:
+    //     end
+    //     else begin
+    //         // 不允许发送数据
+    //         fifo_rd_en = 0;
+    //     end
+    // end
     // 没有所谓的权限，能传就传，不管优先级，满了就自己停住
     // 为什么总是有错？？222
     // always @(*) begin
