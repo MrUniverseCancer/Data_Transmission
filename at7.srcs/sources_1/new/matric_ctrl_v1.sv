@@ -30,7 +30,7 @@ module matric_ctrl_v1
         parameter SERIAL_NUM        = 1,
         parameter ACCURACY          = 1,
         parameter N_ROW             = 4,
-        parameter N_COL             = 8,  // ensured that N_COL is 8 * ADC_NUM
+        parameter N_COL             = 8,  // ensured that N_COL is 8 * ADC_NUM 每个ADC由8个点位，每个点位的大小是3字节
         // parameter N_ROW             = 4,240
         // parameter N_COL             = 8,120
         parameter CLK_FRE           = 50, //MHz
@@ -58,6 +58,7 @@ module matric_ctrl_v1
     reg [7:0] r_data_to_fifo;
     assign o_data_to_fifo = r_data_to_fifo;
     // Data Format: {SEND_HEAD4, SEND_ALL_LEN2, SEND_SERIALNUM1, SEND_DATA_LEN4, send_pkt_num4, send_time4,send_accuracy, reserved ,matrix_data(3*N_ROW*N_COL), send_sum_check1}
+    // 为提前确定数据帧长度而设置的参数，单位 字节
     localparam  LEN_send_head           = 4;  // 32
     localparam  LEN_send_all_len        = 3;  // 24
     localparam  LEN_send_serialNum      = 1;  // 8
@@ -69,7 +70,7 @@ module matric_ctrl_v1
     localparam  LEN_row_data            = 24 * ADC_NUM;  // 192 * ADC_NUM
     localparam  LEN_send_sum_check      = 1;  // 8
 
-    
+    // 将数据帧的各个部分拆分开，其中的位宽由上面的长度参数决定
     wire [8 * LEN_send_head - 1: 0]         send_head;
     wire [8 * LEN_send_all_len - 1: 0]      send_all_len;
     wire [8 * LEN_send_serialNum - 1: 0]    send_serialNum;
@@ -81,6 +82,8 @@ module matric_ctrl_v1
     wire [8 * LEN_row_data - 1: 0]          send_row_data;
     reg  [8 * LEN_send_sum_check - 1: 0]    send_sum_check;
 
+    // 一位的控制信号，用于判断数据帧的各个部分是否需要发送
+    // 由宏参数BITMASK决定，每一位对应一个部分
     wire [ 0: 0] head_send;
     wire [ 0: 0] all_len_send;
     wire [ 0: 0] serialNum_send;
@@ -103,8 +106,10 @@ module matric_ctrl_v1
     assign row_data_send    = | (BITMASK & 10'b00_0000_0010);
     assign sum_check_send   = | (BITMASK & 10'b00_0000_0001);
 
+    // 用于计算等待时间的参数，每一行传递的等待间隙
     localparam                          WAIT_TIME_row   = CLK_FRE * 1000000 / DATA_RATE / N_ROW - 1;
 
+    // 状态机的状态
     localparam                          S_IDLE              = 13'b0_0000_0000_0001;
     localparam                          S_SEND_HEAD         = 13'b0_0000_0000_0010;
     localparam                          S_SEND_ALL_LEN      = 13'b0_0000_0000_0100;
@@ -133,12 +138,10 @@ module matric_ctrl_v1
     reg  [12:0]                           next_state;
 
     // Data Format
+    // 数据帧的包头的固定值
     assign send_head        = 32'h13_57_9A_CE;
-    // assign send_all_len     = LEN_send_head & {32{head_send}}           + LEN_send_all_len & {32{all_len_send}} + 
-    //                           LEN_send_serialNum & {32{serialNum_send}} + LEN_send_data_len  & {32{data_len_send}}+ 
-    //                           LEN_send_pkt_num & {32{pkt_num_send}}     + LEN_send_time & {32{time_send}} + 
-    //                           LEN_send_accuracy & {32{accuracy_send}}   + LEN_send_reserved  & {32{reserved_send}}+
-    //                           LEN_send_sum_check & {32{sum_check_send}} + (LEN_row_data & {32{row_data_send}}) << 2;
+
+    // 计算数据帧的总长度
     wire [31: 0] len_1  = LEN_send_head & {32{head_send}}           ;
     wire [31: 0] len_2  = LEN_send_serialNum & {32{serialNum_send}} ;
     wire [31: 0] len_3  = LEN_send_pkt_num & {32{pkt_num_send}}     ;
@@ -153,19 +156,28 @@ module matric_ctrl_v1
     // assign send_all_len = 16'h24_68; // TODO:
     // 莫名其妙的Bugs，拆开就正常输出，写在一起就报错
 
+    // 设备序列码，由于被BITMASK控制，所以这里实际弃用
     assign send_serialNum   = SERIAL_NUM;
-    // assign send_data_len    = 3 * N_ROW * N_COL;
+    
+    // 将行列数拼接成一个32位的数
     wire [15: 0] temp_row   = N_ROW;
     wire [15: 0] temp_col   = N_COL;
     assign send_data_len    = {temp_row,temp_col};
-    // assign send_data_len    = {16'h1423, 16'h3546};
+    
+    // 区分是FPGA还是STM32的数据
     assign send_accuracy    = (ACCURACY == 1) ? 8'h96 : 8'h69;
+
+    // 保留字节，赋值为零
     assign send_reserved    = 32'd0;
+
+    // 数据和返回帧每个包随之变化
+    // 包号和时间戳有两个子模块控制
 
     // Control Signal
     assign o_fifo_wr_en = r_data_to_fifo_valid && ~i_fifo_full;
 
     // 指示返回帧可以开始传输
+    // 这是返回帧与数据帧的优先级关系
     assign o_returnFrame_begin = (state == S_IDLE);
 
 
@@ -185,6 +197,10 @@ module matric_ctrl_v1
     begin
         case(state)
             S_IDLE:
+            // 什么情况开始进行数据帧传递
+            // 1. i_returnFrame_begin表明没有返回帧需要传递
+            // 2. i_start_matrix表明开始传递数据帧
+            // 3. i_fifo_full表明FIFO没有满，这里并不是IDLE特有的
                 if (i_start_matrix == 1'b1 && ~i_fifo_full && ~i_returnFrame_begin)
                     next_state = S_SEND_HEAD;
                 else
@@ -553,6 +569,7 @@ module matric_ctrl_v1
     // FSM end
     //-------------------------------------
     // Data Format
+    // 控制包号和时间戳的模块
     cal_pkt_num#
     (
         .LEN_send_pkt_num(LEN_send_pkt_num)
